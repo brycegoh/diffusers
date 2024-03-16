@@ -738,6 +738,8 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
 def prepare_train_dataset(dataset, accelerator):
     image_transforms = transforms.Compose(
         [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
@@ -751,34 +753,34 @@ def prepare_train_dataset(dataset, accelerator):
         ]
     )
 
-    def crop(image):
-        train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
-        train_crop = transforms.CenterCrop(args.resolution)
-        image = train_resize(image)    
+    # def crop(image):
+    #     train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+    #     train_crop = transforms.CenterCrop(args.resolution)
+    #     image = train_resize(image)    
 
-        y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-        x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-        image = train_crop(image)
+    #     y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+    #     x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+    #     image = train_crop(image)
         
-        crop_top_left = (y1, x1)
-        return crop_top_left
+    #     crop_top_left = (y1, x1)
+    #     return crop_top_left
 
     def preprocess_train(examples):
         original_sizes = []
         crop_coords = []
         print(examples.keys())
-        images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
+        images = [image.convert("RGB") for image in examples[args.image_column]]
         original_sizes = [(image.width, image.height) for image in images]
-        crop_coords = [crop(image, args.resolution) for image in images]
+        # crop_coords = [crop(image, args.resolution) for image in images]
         images = [image_transforms(image) for image in images]
 
-        conditioning_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
+        conditioning_images = [image.convert("RGB") for image in examples[args.conditioning_image_column]]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
 
         examples["pixel_values"] = images
         examples["conditioning_pixel_values"] = conditioning_images
-        examples["original_sizes"] = original_sizes
-        examples["crop_top_lefts"] = crop_coords
+        # examples["original_sizes"] = original_sizes
+        # examples["crop_top_lefts"] = crop_coords
         return examples
 
     with accelerator.main_process_first():
@@ -1039,12 +1041,9 @@ def main(args):
     # Here, we compute not just the text embeddings but also the additional embeddings
     # needed for the SD XL UNet to operate.
     def compute_embeddings(batch, proportion_empty_prompts, text_encoders, tokenizers, is_train=True):
-        original_sizes = batch.get("original_sizes")
-        crops_coords_top_left = batch.get("crop_top_lefts")
-        original_sizes = torch.tensor(original_sizes, dtype=torch.long).to(accelerator.device)
-        crops_coords_top_left = torch.tensor(crops_coords_top_left, dtype=torch.long).to(accelerator.device)
-
+        original_size = (args.resolution, args.resolution)
         target_size = (args.resolution, args.resolution)
+        crops_coords_top_left = (args.crops_coords_top_left_h, args.crops_coords_top_left_w)
         prompt_batch = batch[args.caption_column]
 
         prompt_embeds, pooled_prompt_embeds = encode_prompt(
@@ -1053,12 +1052,13 @@ def main(args):
         add_text_embeds = pooled_prompt_embeds
 
         # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-        add_time_ids = torch.cat([original_sizes, crops_coords_top_left, target_size.repeat(len(prompt_batch), 1)], dim=-1)
-        add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor([add_time_ids])
 
         prompt_embeds = prompt_embeds.to(accelerator.device)
         add_text_embeds = add_text_embeds.to(accelerator.device)
-
+        add_time_ids = add_time_ids.repeat(len(prompt_batch), 1)
+        add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
         unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
         return {"prompt_embeds": prompt_embeds, **unet_added_cond_kwargs}
@@ -1081,9 +1081,6 @@ def main(args):
     tokenizers = [tokenizer_one, tokenizer_two]
     train_dataset = get_train_dataset(args, accelerator)
 
-    # Then get the training dataset ready to be passed to the dataloader.
-    train_dataset = prepare_train_dataset(train_dataset, accelerator)
-
     compute_embeddings_fn = functools.partial(
         compute_embeddings,
         text_encoders=text_encoders,
@@ -1102,7 +1099,8 @@ def main(args):
     gc.collect()
     torch.cuda.empty_cache()
 
-    
+    # Then get the training dataset ready to be passed to the dataloader.
+    train_dataset = prepare_train_dataset(train_dataset, accelerator)    
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
