@@ -862,6 +862,7 @@ def main(args):
 
     # Load scheduler and models
     if args.do_edm_style_training:
+        print("Loading EDM style scheduler and models")
         noise_scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     else:
         noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
