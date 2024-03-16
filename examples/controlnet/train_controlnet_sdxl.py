@@ -784,16 +784,11 @@ def collate_fn(examples):
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
-    original_sizes = [example["original_sizes"] for example in examples]
-    crop_top_lefts = [example["crop_top_lefts"] for example in examples]
-
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
-        "original_sizes": original_sizes,
-        "crop_top_lefts": crop_top_lefts,
     }
 
 
