@@ -100,7 +100,8 @@ def log_validation(vae, unet, controlnet, args, accelerator, weight_dtype, step,
             torch_dtype=weight_dtype,
         )
 
-    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    if not args.do_edm_style_training:
+        pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
