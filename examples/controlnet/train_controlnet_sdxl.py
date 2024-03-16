@@ -37,6 +37,7 @@ from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
+from torch.utils.data import Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
@@ -49,6 +50,7 @@ from diffusers import (
     StableDiffusionXLControlNetPipeline,
     UNet2DConditionModel,
     UniPCMultistepScheduler,
+    EulerDiscreteScheduler,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
@@ -581,6 +583,12 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--do_edm_style_training",
+        default=False,
+        action="store_true",
+        help="Flag to conduct training using the EDM formulation as introduced in https://arxiv.org/abs/2206.00364.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -730,8 +738,6 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
 def prepare_train_dataset(dataset, accelerator):
     image_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
@@ -745,8 +751,25 @@ def prepare_train_dataset(dataset, accelerator):
         ]
     )
 
+    def crop(image):
+        train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+        train_crop = transforms.CenterCrop(args.resolution)
+        image = train_resize(image)    
+
+        y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
+        x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
+        image = train_crop(image)
+        
+        crop_top_left = (y1, x1)
+        return crop_top_left
+
     def preprocess_train(examples):
+        original_sizes = []
+        crop_coords = []
+
         images = [image.convert("RGB") for image in examples[args.image_column]]
+        original_sizes = [(image.width, image.height) for image in images]
+        crop_coords = [crop(image, args.resolution) for image in images]
         images = [image_transforms(image) for image in images]
 
         conditioning_images = [image.convert("RGB") for image in examples[args.conditioning_image_column]]
@@ -754,7 +777,8 @@ def prepare_train_dataset(dataset, accelerator):
 
         examples["pixel_values"] = images
         examples["conditioning_pixel_values"] = conditioning_images
-
+        examples["original_sizes"] = original_sizes
+        examples["crop_top_lefts"] = crop_coords
         return examples
 
     with accelerator.main_process_first():
@@ -775,11 +799,16 @@ def collate_fn(examples):
     add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
     add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
 
+    original_sizes = [example["original_sizes"] for example in examples]
+    crop_top_lefts = [example["crop_top_lefts"] for example in examples]
+
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_ids": prompt_ids,
         "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
+        "original_sizes": original_sizes,
+        "crop_top_lefts": crop_top_lefts,
     }
 
 
@@ -852,7 +881,11 @@ def main(args):
     )
 
     # Load scheduler and models
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    if args.do_edm_style_training:
+        noise_scheduler = EulerDiscreteScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    else:
+        noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
@@ -1006,9 +1039,12 @@ def main(args):
     # Here, we compute not just the text embeddings but also the additional embeddings
     # needed for the SD XL UNet to operate.
     def compute_embeddings(batch, proportion_empty_prompts, text_encoders, tokenizers, is_train=True):
-        original_size = (args.resolution, args.resolution)
+        original_sizes = batch.get("original_sizes")
+        crops_coords_top_left = batch.get("crop_top_lefts")
+        original_sizes = torch.tensor(original_sizes, dtype=torch.long).to(accelerator.device)
+        crops_coords_top_left = torch.tensor(crops_coords_top_left, dtype=torch.long).to(accelerator.device)
+
         target_size = (args.resolution, args.resolution)
-        crops_coords_top_left = (args.crops_coords_top_left_h, args.crops_coords_top_left_w)
         prompt_batch = batch[args.caption_column]
 
         prompt_embeds, pooled_prompt_embeds = encode_prompt(
@@ -1017,16 +1053,27 @@ def main(args):
         add_text_embeds = pooled_prompt_embeds
 
         # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids])
+        add_time_ids = torch.cat([original_sizes, crops_coords_top_left, target_size.repeat(len(prompt_batch), 1)], dim=-1)
+        add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
 
         prompt_embeds = prompt_embeds.to(accelerator.device)
         add_text_embeds = add_text_embeds.to(accelerator.device)
-        add_time_ids = add_time_ids.repeat(len(prompt_batch), 1)
-        add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
+
         unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
         return {"prompt_embeds": prompt_embeds, **unet_added_cond_kwargs}
+
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory.
@@ -1169,17 +1216,33 @@ def main(args):
                 bsz = latents.shape[0]
 
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+                if not args.do_edm_style_training:
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
+                else:
+                    # in EDM formulation, the model is conditioned on the pre-conditioned noise levels
+                    # instead of discrete timesteps, so here we sample indices to get the noise levels
+                    # from `scheduler.timesteps`
+                    indices = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,))
+                    timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+                # For EDM-style training, we first obtain the sigmas based on the continuous timesteps.
+                # We then precondition the final model inputs based on these sigmas instead of the timesteps.
+                # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
+                if args.do_edm_style_training:
+                    sigmas = get_sigmas(timesteps, len(noisy_latents.shape), noisy_latents.dtype)
+                    inp_noisy_latents = noisy_latents / ((sigmas**2 + 1) ** 0.5)
+
+                noise_input = noisy_latents if not args.do_edm_style_training else inp_noisy_latents
+
                 # ControlNet conditioning.
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
                 down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents,
+                    noise_input,
                     timesteps,
                     encoder_hidden_states=batch["prompt_ids"],
                     added_cond_kwargs=batch["unet_added_conditions"],
@@ -1189,7 +1252,7 @@ def main(args):
 
                 # Predict the noise residual
                 model_pred = unet(
-                    noisy_latents,
+                    noise_input,
                     timesteps,
                     encoder_hidden_states=batch["prompt_ids"],
                     added_cond_kwargs=batch["unet_added_conditions"],
@@ -1200,14 +1263,25 @@ def main(args):
                     return_dict=False,
                 )[0]
 
+                if args.do_edm_style_training:
+                    model_pred = model_pred * (-sigmas) + noisy_latents
+                    weighing = sigmas**-2.0
+
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
+                    target = latents if args.do_edm_style_training else noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                
+                if args.do_edm_style_training:
+                    loss = torch.mean(
+                        (weighing.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1), 1
+                    )
+                    loss = loss.mean()
+                else:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
