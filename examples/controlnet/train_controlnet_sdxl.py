@@ -1080,6 +1080,10 @@ def main(args):
     text_encoders = [text_encoder_one, text_encoder_two]
     tokenizers = [tokenizer_one, tokenizer_two]
     train_dataset = get_train_dataset(args, accelerator)
+
+    # Then get the training dataset ready to be passed to the dataloader.
+    train_dataset = prepare_train_dataset(train_dataset, accelerator)
+
     compute_embeddings_fn = functools.partial(
         compute_embeddings,
         text_encoders=text_encoders,
@@ -1098,8 +1102,7 @@ def main(args):
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Then get the training dataset ready to be passed to the dataloader.
-    train_dataset = prepare_train_dataset(train_dataset, accelerator)
+    
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
