@@ -766,7 +766,7 @@ def prepare_train_dataset(dataset, accelerator):
     def preprocess_train(examples):
         original_sizes = []
         crop_coords = []
-
+        print(examples[args.image_column])
         images = [image.convert("RGB") for image in examples[args.image_column]]
         original_sizes = [(image.width, image.height) for image in images]
         crop_coords = [crop(image, args.resolution) for image in images]
